@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pipeline Dashboard</title>
+<style>
+  :root { --bg:#0f1115; --card:#1a1d24; --ink:#e8e9ec; --dim:#9aa0ab; --acc:#4f8cff;
+          --ok:#3fb27f; --warn:#e0a93e; --bad:#e05d5d; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif; }
+  header { padding:16px 24px; border-bottom:1px solid #2a2e38; display:flex;
+           justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;}
+  h1 { font-size:18px; margin:0; }
+  main { max-width:860px; margin:0 auto; padding:24px; }
+  .card { background:var(--card); border:1px solid #2a2e38; border-radius:10px;
+          padding:18px 20px; margin-bottom:16px; }
+  .tag { display:inline-block; font-size:12px; padding:2px 8px; border-radius:10px;
+         background:#262b36; color:var(--dim); margin-right:6px; }
+  .tag.ok{color:var(--ok)} .tag.warn{color:var(--warn)} .tag.bad{color:var(--bad)}
+  button { background:var(--acc); color:#fff; border:0; border-radius:8px;
+           padding:9px 16px; font-size:14px; cursor:pointer; margin:4px 6px 0 0; }
+  button.secondary { background:#2a2e38; } button.danger { background:var(--bad); }
+  button:disabled { opacity:.5; cursor:wait; }
+  input, textarea { width:100%; background:#12141a; color:var(--ink);
+           border:1px solid #2a2e38; border-radius:8px; padding:8px 10px; font-size:14px; }
+  label { display:block; margin:10px 0 4px; color:var(--dim); font-size:13px; }
+  .alt { border:1px solid #2a2e38; border-radius:8px; padding:10px 12px; margin:8px 0;
+         cursor:pointer; }
+  .alt.sel { border-color:var(--acc); background:#1c2333; }
+  .muted { color:var(--dim); font-size:13px; }
+  details summary { cursor:pointer; color:var(--dim); margin-top:8px; }
+  #status { font-size:13px; color:var(--dim); }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  td,th { text-align:left; padding:4px 8px; border-bottom:1px solid #2a2e38; }
+</style>
+</head>
+<body>
+<header>
+  <h1>YouTube Pipeline</h1>
+  <div>
+    <span id="status">not connected</span>
+    <button class="secondary" onclick="showSetup()">Settings</button>
+    <button class="secondary" onclick="loadAll()">Refresh</button>
+  </div>
+</header>
+<main>
+  <div class="card" id="setup" style="display:none">
+    <h3 style="margin-top:0">Connect to your pipeline repo</h3>
+    <label>GitHub fine-grained token (needs Contents read/write on the pipeline repo — stays in this browser only)</label>
+    <input id="token" type="password" placeholder="github_pat_…">
+    <label>Repo owner (your GitHub username)</label>
+    <input id="owner" placeholder="e.g. willbarnard">
+    <label>Repo name</label>
+    <input id="repo" value="youtube-pipeline">
+    <button onclick="saveSetup()">Save & connect</button>
+  </div>
+  <div id="cards"><p class="muted">Loading…</p></div>
+</main>
+<script>
+const LS = window.localStorage;
+const api = (path, opts={}) => fetch(`https://api.github.com${path}`, {
+  ...opts,
+  headers: { "Authorization": `Bearer ${LS.gh_token}`,
+             "Accept": "application/vnd.github+json",
+             "X-GitHub-Api-Version": "2022-11-28", ...(opts.headers||{}) }
+});
+const repoPath = () => `/repos/${LS.gh_owner}/${LS.gh_repo}`;
+const b64 = s => btoa(unescape(encodeURIComponent(s)));
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+function showSetup(){ document.getElementById("setup").style.display="block"; }
+function saveSetup(){
+  LS.gh_token = document.getElementById("token").value.trim() || LS.gh_token || "";
+  LS.gh_owner = document.getElementById("owner").value.trim();
+  LS.gh_repo  = document.getElementById("repo").value.trim() || "youtube-pipeline";
+  document.getElementById("setup").style.display="none";
+  loadAll();
+}
+
+async function listDir(path){
+  const r = await api(`${repoPath()}/contents/${path}`);
+  if (r.status === 404) return [];
+  if (!r.ok) throw new Error(`${r.status} on ${path}`);
+  return r.json();
+}
+async function readJson(path){
+  const r = await api(`${repoPath()}/contents/${path}`);
+  if (r.status === 404) return null;
+  if (!r.ok) throw new Error(`${r.status} on ${path}`);
+  const d = await r.json();
+  return JSON.parse(decodeURIComponent(escape(atob(d.content.replace(/\n/g,"")))));
+}
+async function putJson(path, obj, message){
+  const r = await api(`${repoPath()}/contents/${path}`, { method:"PUT",
+    body: JSON.stringify({ message, content: b64(JSON.stringify(obj, null, 2)) }) });
+  if (!r.ok) throw new Error(`write failed: ${r.status} ${await r.text()}`);
+}
+async function fireResume(){
+  await api(`${repoPath()}/dispatches`, { method:"POST",
+    body: JSON.stringify({ event_type:"resume" }) });
+}
+
+async function loadAll(){
+  const cards = document.getElementById("cards");
+  if (!LS.gh_token || !LS.gh_owner){ showSetup(); cards.innerHTML=""; return; }
+  document.getElementById("status").textContent = "loading…";
+  cards.innerHTML = "";
+  try {
+    const channels = (await listDir("state")).filter(x => x.type === "dir");
+    if (!channels.length)
+      cards.innerHTML = `<div class="card muted">No cycles yet. Start one from the
+        repo's Actions tab → pipeline-cycle → Run workflow.</div>`;
+    let history = [];
+    for (const ch of channels){
+      const cycles = (await listDir(`state/${ch.name}`)).filter(x => x.type === "dir")
+                      .sort((a,b)=>b.name.localeCompare(a.name));
+      for (const cy of cycles.slice(0,6)){
+        const base = `state/${ch.name}/${cy.name}`;
+        const meta = await readJson(`${base}/cycle.json`);
+        if (!meta) continue;
+        if (meta.status === "awaiting_topic_decision" && !(await readJson(`${base}/decision1.json`)))
+          cards.appendChild(await checkpoint1Card(ch.name, cy.name, base));
+        else if (meta.status === "awaiting_phase2")
+          cards.appendChild(await checkpoint2Card(ch.name, cy.name, base));
+        else history.push({ch:ch.name, cy:cy.name, status:meta.status});
+      }
+    }
+    if (history.length){
+      const div = document.createElement("div"); div.className="card";
+      div.innerHTML = `<h3 style="margin-top:0">History</h3><table>
+        <tr><th>Channel</th><th>Cycle</th><th>Status</th></tr>` +
+        history.map(h=>`<tr><td>${esc(h.ch)}</td><td>${esc(h.cy)}</td>
+          <td><span class="tag ${h.status==="failed"?"bad":"ok"}">${esc(h.status)}</span></td></tr>`).join("") +
+        `</table>`;
+      cards.appendChild(div);
+    }
+    document.getElementById("status").textContent = `connected: ${LS.gh_owner}/${LS.gh_repo}`;
+  } catch(e){
+    document.getElementById("status").textContent = "error";
+    cards.innerHTML = `<div class="card"><span class="tag bad">error</span> ${esc(e.message)}
+      — check token/owner/repo in Settings.</div>`;
+  }
+}
+
+async function checkpoint1Card(channel, cycle, base){
+  const cp = await readJson(`${base}/checkpoint1.json`);
+  const div = document.createElement("div"); div.className = "card";
+  const rec = cp.recommendation;
+  const opt = (c, sel) => `<div class="alt ${sel?"sel":""}" data-id="${esc(c.candidate_id)}"
+      onclick="pick(this)"><b>${esc(c.title)}</b> <span class="tag">${c.total}/100</span>
+      ${c.policy_flags?.length?`<span class="tag warn">${esc(c.policy_flags.join(","))}</span>`:""}
+      <div class="muted">${esc(c.summary)} — <i>${esc(c.rationale)}</i></div></div>`;
+  div.innerHTML = `
+    <span class="tag warn">CHECKPOINT 1 · topic</span>
+    <span class="tag">${esc(channel)}</span><span class="tag">${esc(cycle)}</span>
+    <span class="tag">auto-proceeds ${new Date(cp.deadline).toLocaleString()}</span>
+    <h3>Recommended: ${esc(rec.title)}</h3>
+    ${opt(rec, true)}
+    ${cp.alternatives.length ? "<p class='muted'>Alternatives:</p>" + cp.alternatives.map(c=>opt(c,false)).join("") : ""}
+    <label>Note to the pipeline (used on reject/approve)</label>
+    <textarea rows="2" class="note"></textarea>
+    <button onclick="decide(this,'approve')">Approve selected</button>
+    <button class="secondary" onclick="decide(this,'reject')">Reject all — research again</button>
+    <button class="danger" onclick="decide(this,'pause')">Pause cycle</button>`;
+  div.dataset.base = base; div.dataset.rec = rec.candidate_id;
+  return div;
+}
+function pick(el){
+  el.closest(".card").querySelectorAll(".alt").forEach(a=>a.classList.remove("sel"));
+  el.classList.add("sel");
+}
+async function decide(btn, action){
+  const card = btn.closest(".card");
+  card.querySelectorAll("button").forEach(b=>b.disabled=true);
+  const chosen = card.querySelector(".alt.sel")?.dataset.id || card.dataset.rec;
+  try {
+    await putJson(`${card.dataset.base}/decision1.json`, {
+      decided_by:"human", action, chosen_candidate_id: chosen,
+      note: card.querySelector(".note").value,
+      decided_at: new Date().toISOString(),
+    }, `dashboard decision: ${action}`);
+    if (action !== "pause") await fireResume();
+    card.innerHTML = `<span class="tag ok">submitted</span> ${action} — the pipeline
+      will pick it up within a minute. Refresh later for results.`;
+  } catch(e){
+    alert(e.message); card.querySelectorAll("button").forEach(b=>b.disabled=false);
+  }
+}
+
+async function checkpoint2Card(channel, cycle, base){
+  const cp = await readJson(`${base}/checkpoint2.json`);
+  const div = document.createElement("div"); div.className = "card";
+  const ledger = (cp.quote_ledger||[]).map(q =>
+    `<tr><td><span class="tag ${q.mode==="real"?"ok":"warn"}">${esc(q.mode)}</span></td>
+     <td>${esc(q.text)}</td><td>${esc(q.speaker||"")} ${esc(q.date||"")}
+     ${q.url?`<a href="${esc(q.url)}" target="_blank" style="color:var(--acc)">src</a>`:""}</td></tr>`).join("");
+  div.innerHTML = `
+    <span class="tag ok">CHECKPOINT 2 · plan ready</span>
+    <span class="tag">${esc(channel)}</span><span class="tag">${esc(cycle)}</span>
+    <h3>${esc(cp.topic_title)}</h3>
+    <p>${esc(cp.plan_summary)}</p>
+    <p class="muted">Assets planned: ${esc(JSON.stringify(cp.asset_manifest_counts))}</p>
+    ${ledger?`<details><summary>Quote ledger (${(cp.quote_ledger||[]).length})</summary>
+      <table><tr><th>Mode</th><th>Text</th><th>Attribution</th></tr>${ledger}</table></details>`:""}
+    <p class="muted">${esc(cp.phase_note||"")} Full plan: <code>${esc(base)}/plan.md</code> in the repo.</p>`;
+  return div;
+}
+
+if (LS.gh_token && LS.gh_owner) loadAll(); else showSetup();
+</script>
+</body>
+</html>
