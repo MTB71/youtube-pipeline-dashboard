@@ -122,8 +122,14 @@ async function loadAll(){
         if (!meta) continue;
         if (meta.status === "awaiting_topic_decision" && !(await readJson(`${base}/decision1.json`)))
           cards.appendChild(await checkpoint1Card(ch.name, cy.name, base));
-        else if (meta.status === "awaiting_phase2")
+        else if (meta.status === "awaiting_phase2" && !(await readJson(`${base}/decision2.json`)))
           cards.appendChild(await checkpoint2Card(ch.name, cy.name, base));
+        else if (meta.status === "awaiting_phase3")
+          cards.appendChild(await videoReadyCard(ch.name, cy.name, base, meta));
+        else if (meta.status === "awaiting_publish_decision" && !(await readJson(`${base}/decision3.json`)))
+          cards.appendChild(await checkpoint3Card(ch.name, cy.name, base));
+        else if (meta.status === "compliance_blocked" && !(await readJson(`${base}/decision3.json`)))
+          cards.appendChild(await blockedCard(ch.name, cy.name, base, meta));
         else history.push({ch:ch.name, cy:cy.name, status:meta.status});
       }
     }
@@ -196,15 +202,122 @@ async function checkpoint2Card(channel, cycle, base){
     `<tr><td><span class="tag ${q.mode==="real"?"ok":"warn"}">${esc(q.mode)}</span></td>
      <td>${esc(q.text)}</td><td>${esc(q.speaker||"")} ${esc(q.date||"")}
      ${q.url?`<a href="${esc(q.url)}" target="_blank" style="color:var(--acc)">src</a>`:""}</td></tr>`).join("");
+  const stale = new Date(cp.deadline) < new Date(Date.now() - 72*3600*1000);
   div.innerHTML = `
     <span class="tag ok">CHECKPOINT 2 · plan ready</span>
     <span class="tag">${esc(channel)}</span><span class="tag">${esc(cycle)}</span>
+    ${stale ? `<span class="tag warn">expired — waits for your click</span>`
+            : `<span class="tag">auto-generates ${new Date(cp.deadline).toLocaleString()}</span>`}
     <h3>${esc(cp.topic_title)}</h3>
     <p>${esc(cp.plan_summary)}</p>
     <p class="muted">Assets planned: ${esc(JSON.stringify(cp.asset_manifest_counts))}</p>
     ${ledger?`<details><summary>Quote ledger (${(cp.quote_ledger||[]).length})</summary>
       <table><tr><th>Mode</th><th>Text</th><th>Attribution</th></tr>${ledger}</table></details>`:""}
-    <p class="muted">${esc(cp.phase_note||"")} Full plan: <code>${esc(base)}/plan.md</code> in the repo.</p>`;
+    <p class="muted">${esc(cp.phase_note||"")} Full plan: <code>${esc(base)}/plan.md</code> in the repo.</p>
+    <label>Note to the pipeline (used on reject)</label>
+    <textarea rows="2" class="note"></textarea>
+    <button onclick="decide2(this,'approve')">Approve — generate video</button>
+    <button class="secondary" onclick="decide2(this,'reject')">Reject — redo the plan</button>
+    <button class="danger" onclick="decide2(this,'pause')">Pause cycle</button>`;
+  div.dataset.base = base;
+  return div;
+}
+async function decide2(btn, action){
+  const card = btn.closest(".card");
+  card.querySelectorAll("button").forEach(b=>b.disabled=true);
+  try {
+    await putJson(`${card.dataset.base}/decision2.json`, {
+      decided_by:"human", action,
+      note: card.querySelector(".note").value,
+      decided_at: new Date().toISOString(),
+    }, `dashboard decision2: ${action}`);
+    if (action !== "pause") await fireResume();
+    card.innerHTML = `<span class="tag ok">submitted</span> ${action} —
+      ${action==="approve" ? "the video is rendering now (allow up to ~30 min), then appears under this cycle as ready."
+                           : "the pipeline will pick it up within a minute."}`;
+  } catch(e){
+    alert(e.message); card.querySelectorAll("button").forEach(b=>b.disabled=false);
+  }
+}
+
+async function checkpoint3Card(channel, cycle, base){
+  const cp = await readJson(`${base}/checkpoint3.json`);
+  const div = document.createElement("div"); div.className = "card";
+  const flagged = cp.compliance !== "pass";
+  div.innerHTML = `
+    <span class="tag ok">CHECKPOINT 3 · ready to publish</span>
+    <span class="tag">${esc(channel)}</span><span class="tag">${esc(cycle)}</span>
+    <span class="tag ${flagged?"warn":"ok"}">compliance: ${esc(cp.compliance)}</span>
+    ${flagged ? `<span class="tag warn">flagged — will NOT auto-publish</span>`
+              : `<span class="tag">auto-publishes ${new Date(cp.deadline).toLocaleString()}</span>`}
+    <h3>${esc(cp.metadata?.title || "(no title)")}</h3>
+    ${flagged ? `<p class="muted">Compliance notes: ${esc(cp.compliance_reasons||"")}</p>` : ""}
+    <p>${esc(Math.round(cp.duration_seconds))}s · generation ~$${esc(cp.estimated_cost_usd)} ·
+       <a href="${esc(cp.watch_url)}" target="_blank" style="color:var(--acc)">watch private preview</a> ·
+       <a href="${esc(cp.studio_url)}" target="_blank" style="color:var(--acc)">open in Studio</a></p>
+    <p class="muted">Preview is visible only while signed in as the channel owner.
+       While the YouTube API audit is pending, "Publish" may leave the video
+       locked private — the card will say so; flip it in Studio if needed.</p>
+    <details><summary>Description as it will publish</summary>
+      <p class="muted">${esc(cp.metadata?.description||"")}</p></details>
+    <label>Note to the pipeline (used on reject)</label>
+    <textarea rows="2" class="note"></textarea>
+    <button onclick="decide3(this,'publish')">Publish — make public</button>
+    <button class="secondary" onclick="decide3(this,'reject')">Reject — redo from plan</button>
+    <button class="danger" onclick="decide3(this,'pause')">Hold</button>`;
+  div.dataset.base = base;
+  return div;
+}
+
+async function blockedCard(channel, cycle, base, meta){
+  const comp = await readJson(`${base}/compliance.json`) || {};
+  const probs = (comp.deterministic?.problems||[]).map(p=>`<li>[${esc(p.rule)}] ${esc(p.detail)}</li>`).join("")
+    + (comp.model_review?.reasons||[]).map(r=>`<li>[model] ${esc(r)}</li>`).join("");
+  const div = document.createElement("div"); div.className = "card";
+  div.innerHTML = `
+    <span class="tag bad">COMPLIANCE BLOCK</span>
+    <span class="tag">${esc(channel)}</span><span class="tag">${esc(cycle)}</span>
+    <p>This video was blocked before upload and will never publish on its own.
+       Reasons:</p>
+    <ul class="muted">${probs || "<li>(see compliance.json in the repo)</li>"}</ul>
+    <label>Note to the pipeline (direction for the redo)</label>
+    <textarea rows="2" class="note"></textarea>
+    <button class="secondary" onclick="decide3(this,'reject')">Redo from plan with my note</button>
+    <button class="danger" onclick="decide3(this,'pause')">Leave held</button>`;
+  div.dataset.base = base;
+  return div;
+}
+
+async function decide3(btn, action){
+  const card = btn.closest(".card");
+  card.querySelectorAll("button").forEach(b=>b.disabled=true);
+  try {
+    await putJson(`${card.dataset.base}/decision3.json`, {
+      decided_by:"human", action,
+      note: card.querySelector(".note").value,
+      decided_at: new Date().toISOString(),
+    }, `dashboard decision3: ${action}`);
+    if (action !== "pause") await fireResume();
+    card.innerHTML = `<span class="tag ok">submitted</span> ${action} — the pipeline
+      will pick it up within a minute. Refresh later for the result.`;
+  } catch(e){
+    alert(e.message); card.querySelectorAll("button").forEach(b=>b.disabled=false);
+  }
+}
+
+async function videoReadyCard(channel, cycle, base, meta){
+  const info = await readJson(`${base}/video_info.json`) || {};
+  const costs = await readJson(`${base}/costs.json`) || {};
+  const div = document.createElement("div"); div.className = "card";
+  div.innerHTML = `
+    <span class="tag ok">VIDEO READY · awaiting Phase 3</span>
+    <span class="tag">${esc(channel)}</span><span class="tag">${esc(cycle)}</span>
+    <p>${esc(info.duration_seconds||"?")}s · ${esc(info.size_mb||"?")} MB ·
+       generation cost ~$${esc(costs.total_usd ?? "?")}</p>
+    <p class="muted">Download: repo → <b>Actions</b> tab → the newest green run →
+      <b>Artifacts</b> → <code>videos-…</code>. YouTube upload is waiting on the
+      one-time OAuth setup (SETUP_PHASE3.md) — once the tokens are in place the
+      pipeline picks this cycle up automatically.</p>`;
   return div;
 }
 
